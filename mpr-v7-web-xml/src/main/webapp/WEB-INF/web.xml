@@ -8,20 +8,28 @@
     <display-name>MPR Deadlock Reproduction</display-name>
 
     <session-config>
-        <!-- Long session timeout so sessions don't expire during testing -->
         <session-timeout>30</session-timeout>
     </session-config>
 
     <!--
-        Spring Security filter.
+        WebSphere fallback: explicitly bootstrap the Spring ApplicationContext.
 
-        On embedded Tomcat (mvn spring-boot:run) Spring Boot auto-registers
-        this filter.  On WebSphere WAR deployment we declare it explicitly
-        so the container's web.xml processing wires it up reliably.
+        On standard containers the SCI mechanism handles this automatically.
+        WebSphere Traditional often fails to discover the SCI from
+        spring-web.jar, so this listener calls Application.onStartup()
+        directly.  It is a no-op if the SCI already ran.
 
-        The DelegatingFilterProxy lazily looks up the "springSecurityFilterChain"
-        bean from the WebApplicationContext on the first request, so startup
-        order does not matter.
+        MUST be declared BEFORE the DelegatingFilterProxy so the Spring
+        context exists when the filter's first doFilter() tries to look
+        up the "springSecurityFilterChain" bean.
+    -->
+    <listener>
+        <listener-class>org.vaadin.mprdemo.WebSphereBootstrapListener</listener-class>
+    </listener>
+
+    <!--
+        Spring Security filter.  Lazily resolves the "springSecurityFilterChain"
+        bean from the WebApplicationContext on the first request.
     -->
     <filter>
         <filter-name>springSecurityFilterChain</filter-name>
