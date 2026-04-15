@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<web-ext
+    xmlns="http://websphere.ibm.com/xml/ns/javaee"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://websphere.ibm.com/xml/ns/javaee http://websphere.ibm.com/xml/ns/javaee/ibm-web-ext_1_1.xsd"
+    version="1.1">
+
+    <!-- Context root for the application -->
+    <context-root uri="/mprdemo"/>
+
+    <!-- Serve servlets by class name - needed for annotation-based servlets -->
+    <enable-serving-servlets-by-class-name value="true"/>
+
+</web-ext>

@@ -1,0 +1,9 @@
+org/vaadin/mprdemo/SecurityConfig.class
+org/vaadin/mprdemo/Saml2Config.class
+org/vaadin/mprdemo/MyUI.class
+org/vaadin/mprdemo/LoginView.class
+org/vaadin/mprdemo/Application.class
+org/vaadin/mprdemo/ApplicationServiceInitListener.class
+org/vaadin/mprdemo/MyUI$FeederThread.class
+org/vaadin/mprdemo/OldUI.class
+org/vaadin/mprdemo/LegacyView.class
