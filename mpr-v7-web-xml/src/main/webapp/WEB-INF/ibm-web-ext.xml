@@ -5,10 +5,16 @@
     xsi:schemaLocation="http://websphere.ibm.com/xml/ns/javaee http://websphere.ibm.com/xml/ns/javaee/ibm-web-ext_1_1.xsd"
     version="1.1">
 
-    <!-- Context root for the application -->
+    <!-- Context root for the application.
+         The app URL on WebSphere is: http://<host>:9080/mprdemo/  -->
     <context-root uri="/mprdemo"/>
 
-    <!-- Serve servlets by class name - needed for annotation-based servlets -->
+    <!-- Serve servlets by class name - needed for annotation-based servlets
+         (MPR's @WebServlet in com.vaadin.mpr package) -->
     <enable-serving-servlets-by-class-name value="true"/>
+
+    <!-- Enable JSP/Servlet annotation processing — required for
+         Spring's @WebServlet / @WebFilter / @WebListener discovery -->
+    <enable-file-serving value="true"/>
 
 </web-ext>

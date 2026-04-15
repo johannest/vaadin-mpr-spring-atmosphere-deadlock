@@ -12,9 +12,17 @@
         <session-timeout>30</session-timeout>
     </session-config>
 
-    <!-- Spring Security filter — auto-registered by Spring Boot but
-         explicitly declared here for WebSphere WAR deployment where
-         Spring Boot's auto-registration may not be available. -->
+    <!--
+        Spring Security filter.
+
+        On embedded Tomcat (mvn spring-boot:run) Spring Boot auto-registers
+        this filter.  On WebSphere WAR deployment we declare it explicitly
+        so the container's web.xml processing wires it up reliably.
+
+        The DelegatingFilterProxy lazily looks up the "springSecurityFilterChain"
+        bean from the WebApplicationContext on the first request, so startup
+        order does not matter.
+    -->
     <filter>
         <filter-name>springSecurityFilterChain</filter-name>
         <filter-class>org.springframework.web.filter.DelegatingFilterProxy</filter-class>
@@ -23,6 +31,11 @@
     <filter-mapping>
         <filter-name>springSecurityFilterChain</filter-name>
         <url-pattern>/*</url-pattern>
+        <dispatcher>REQUEST</dispatcher>
+        <dispatcher>FORWARD</dispatcher>
+        <dispatcher>INCLUDE</dispatcher>
+        <dispatcher>ASYNC</dispatcher>
+        <dispatcher>ERROR</dispatcher>
     </filter-mapping>
 
 </web-app>
