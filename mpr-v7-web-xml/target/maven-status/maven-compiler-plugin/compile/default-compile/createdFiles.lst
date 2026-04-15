@@ -5,5 +5,7 @@ org/vaadin/mprdemo/LoginView.class
 org/vaadin/mprdemo/Application.class
 org/vaadin/mprdemo/ApplicationServiceInitListener.class
 org/vaadin/mprdemo/MyUI$FeederThread.class
+org/vaadin/mprdemo/DeadlockTriggerServlet.class
 org/vaadin/mprdemo/OldUI.class
+org/vaadin/mprdemo/WebSphereBootstrapListener.class
 org/vaadin/mprdemo/LegacyView.class

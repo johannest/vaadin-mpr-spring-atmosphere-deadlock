@@ -2,7 +2,9 @@
 /Users/johannes/dev/DL3/mpr-v7-web-xml/src/main/java/org/vaadin/mprdemo/LegacyView.java
 /Users/johannes/dev/DL3/mpr-v7-web-xml/src/main/java/org/vaadin/mprdemo/OldUI.java
 /Users/johannes/dev/DL3/mpr-v7-web-xml/src/main/java/org/vaadin/mprdemo/MyUI.java
+/Users/johannes/dev/DL3/mpr-v7-web-xml/src/main/java/org/vaadin/mprdemo/DeadlockTriggerServlet.java
 /Users/johannes/dev/DL3/mpr-v7-web-xml/src/main/java/org/vaadin/mprdemo/LoginView.java
 /Users/johannes/dev/DL3/mpr-v7-web-xml/src/main/java/org/vaadin/mprdemo/Application.java
 /Users/johannes/dev/DL3/mpr-v7-web-xml/src/main/java/org/vaadin/mprdemo/ApplicationServiceInitListener.java
+/Users/johannes/dev/DL3/mpr-v7-web-xml/src/main/java/org/vaadin/mprdemo/WebSphereBootstrapListener.java
 /Users/johannes/dev/DL3/mpr-v7-web-xml/src/main/java/org/vaadin/mprdemo/SecurityConfig.java

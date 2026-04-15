@@ -7,6 +7,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configuration.WebSecurityCustomizer;
 import org.springframework.security.core.userdetails.User;
 import org.springframework.security.core.userdetails.UserDetailsService;
 import org.springframework.security.provisioning.InMemoryUserDetailsManager;
@@ -102,6 +103,17 @@ public class SecurityConfig {
         }
 
         return http.build();
+    }
+
+    /**
+     * Completely bypass the Spring Security filter chain for the deadlock
+     * test endpoint.  This avoids any interference from security filters
+     * during session invalidation (the test endpoint invalidates the
+     * HttpSession as part of the deadlock reproduction).
+     */
+    @Bean
+    public WebSecurityCustomizer webSecurityCustomizer() {
+        return (web) -> web.ignoring().antMatchers("/deadlock-test");
     }
 
     /**

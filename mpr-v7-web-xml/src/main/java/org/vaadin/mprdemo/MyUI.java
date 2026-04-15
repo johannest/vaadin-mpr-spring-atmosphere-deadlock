@@ -42,7 +42,20 @@ public class MyUI extends VerticalLayout {
 
 	@SuppressWarnings("deprecation")
 	public MyUI() {
-		// --- Header with logout link ---
+		// --- Header with test and logout links ---
+		Anchor deadlockTestLink = new Anchor("deadlock-test", "Deadlock Test");
+		deadlockTestLink.getStyle()
+				.set("color", "blue")
+				.set("font-weight", "bold");
+		deadlockTestLink.setTarget("_blank");   // opens in new tab
+
+		Anchor deadlockNaturalLink = new Anchor(
+				"deadlock-test?mode=natural", "Natural Test");
+		deadlockNaturalLink.getStyle()
+				.set("color", "blue")
+				.set("font-size", "small");
+		deadlockNaturalLink.setTarget("_blank");
+
 		Anchor logoutLink = new Anchor("logout", "Logout");
 		logoutLink.getStyle()
 				.set("margin-left", "auto")
@@ -53,7 +66,8 @@ public class MyUI extends VerticalLayout {
 				+ "click Logout to trigger HttpSession.invalidate()");
 		info.getStyle().set("font-size", "small").set("color", "gray");
 
-		HorizontalLayout header = new HorizontalLayout(info, logoutLink);
+		HorizontalLayout header = new HorizontalLayout(
+				info, deadlockTestLink, deadlockNaturalLink, logoutLink);
 		header.setWidthFull();
 		header.setDefaultVerticalComponentAlignment(Alignment.CENTER);
 		add(header);
