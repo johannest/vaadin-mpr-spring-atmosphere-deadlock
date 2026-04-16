@@ -201,4 +201,8 @@ This is on the order of **nanoseconds**. The flag therefore reduces the deadlock
 
 ### Correct fix
 
-The TOCTOU cannot be fixed by adjusting the position of the `volatile` flag alone. The fundamental problem is that `resource.close()` is called **inside** `synchronized(lock)`, creating a lock-ordering dependency with the container's HttpSession lock. See `RECOMMENDED_FIX.md` for the structural fixes that eliminate the deadlock entirely.
+Replacing the `volatile boolean` with `AtomicBoolean.compareAndSet(false, true)` **before** the `synchronized` block eliminates the TOCTOU entirely — exactly one thread can ever pass the gate. This alone is sufficient to prevent the deadlock: the second thread returns immediately from `disconnect()`, allowing `HttpSession.invalidate()` to complete and release the HttpSession lock, after which the first thread's `resource.close()` → `getAttribute()` proceeds without contention.
+
+Moving `resource.close()` outside `synchronized(lock)` is a recommended additional improvement (defense in depth) — it eliminates the lock-ordering dependency structurally, reduces lock holding time, and protects against any future code path that might bypass the `compareAndSet` gate. But it is not required for correctness.
+
+See `RECOMMENDED_FIX.md` for the detailed fix proposals.

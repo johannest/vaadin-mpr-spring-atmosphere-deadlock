@@ -35,18 +35,18 @@ Thread B:  synchronized(lock) → BLOCKED (held by Thread A)
 
 The window is narrow (~nanoseconds: a few field reads between lock acquisition and the volatile write), so the flag makes the deadlock **orders of magnitude less likely**. But it cannot eliminate it — given enough production logouts, the window is eventually hit.
 
-A correct fix for the TOCTOU alone would be to replace the `volatile boolean` with an `AtomicBoolean` and use `compareAndSet` before the `synchronized` block. However, this still leaves `resource.close()` inside the lock, which is the deeper structural issue. The fixes below address both.
+Replacing the `volatile boolean` with an `AtomicBoolean` and using `compareAndSet(false, true)` before the `synchronized` block **eliminates the TOCTOU and is sufficient to prevent this deadlock** — the second thread returns immediately from `disconnect()`, which lets `HttpSession.invalidate()` complete and release the HttpSession lock, unblocking the first thread's `resource.close()` → `getAttribute()`. See Fix 1a below.
+
+Moving `resource.close()` outside `synchronized(lock)` is a recommended **additional** improvement (defense in depth) that eliminates the lock-ordering dependency structurally. See Fix 1b below.
 
 See `DEADLOCK_ANALYSIS.md` § "Existing Mitigation: the `disconnecting` Flag (TOCTOU Race)" for the detailed timeline and analysis.
 
 ---
 
-## Fix 1 (Recommended): Move `resource.close()` outside `synchronized` in `AtmospherePushConnection.disconnect()`
+## Fix 1 (Recommended): Fix `AtmospherePushConnection.disconnect()`
 
 **Component:** Vaadin Flow (`flow-server`)
 **File:** `com/vaadin/flow/server/communication/AtmospherePushConnection.java`
-
-This is the most targeted fix. The `resource.close()` call at line 358 invokes Atmosphere's shutdown path, which calls back into `HttpSession.getAttribute()` via `SessionTimeoutSupport`. On WebSphere, this acquires the HttpSession lock. Moving this call outside the `synchronized (lock)` block breaks the `AtmospherePushConnection.lock` -> `HttpSession lock` dependency.
 
 ### Current code (lines 312-367):
 
@@ -92,12 +92,11 @@ public void disconnect() {
 }
 ```
 
-### Proposed fix:
+### Fix 1a (Minimal — fixes the deadlock): Replace `volatile boolean` with `AtomicBoolean`
 
-This fix addresses both problems:
+This is the smallest possible change that fully prevents the deadlock.
 
-1. **Structural:** Moves `resource.close()` outside `synchronized(lock)`, eliminating the lock-ordering dependency entirely.
-2. **TOCTOU:** Replaces the `volatile boolean disconnecting` with an `AtomicBoolean` and uses `compareAndSet()` before the `synchronized` block, so at most one thread can ever enter the disconnect logic.
+Replace `volatile boolean disconnecting` with `AtomicBoolean` and use `compareAndSet` as the entry gate:
 
 **Field change:**
 
@@ -109,7 +108,7 @@ private volatile boolean disconnecting;
 private final AtomicBoolean disconnecting = new AtomicBoolean(false);
 ```
 
-*(Add `import java.util.concurrent.atomic.AtomicBoolean;` and update `readObject()` to reinitialize the field.)*
+*(Add `import java.util.concurrent.atomic.AtomicBoolean;`)*
 
 **Method change:**
 
@@ -120,6 +119,77 @@ public void disconnect() {
     // pass this gate — eliminates the TOCTOU race that existed when
     // the volatile boolean was checked outside synchronized(lock) but
     // set inside it.
+    if (!disconnecting.compareAndSet(false, true)) {
+        getLogger().debug("Disconnection already in progress, ignoring request");
+        return;
+    }
+
+    synchronized (lock) {
+        if (!isConnected() || resource == null) {
+            getLogger().debug("Disconnection already happened, ignoring request");
+            disconnecting.set(false);
+            return;
+        }
+        try {
+            if (resource.isResumed()) {
+                connectionLost();
+                return;
+            }
+            if (outgoingMessage != null) {
+                try {
+                    outgoingMessage.get(1000, TimeUnit.MILLISECONDS);
+                } catch (TimeoutException e) {
+                    getLogger().info(
+                            "Timeout waiting for messages to be sent to client before disconnect",
+                            e);
+                } catch (Exception e) {
+                    getLogger().info(
+                            "Error waiting for messages to be sent to client before disconnect",
+                            e);
+                }
+                outgoingMessage = null;
+            }
+            try {
+                resource.close();
+            } catch (IOException e) {
+                getLogger().info("Error when closing push connection", e);
+            }
+            connectionLost();
+        } finally {
+            disconnecting.set(false);
+        }
+    }
+}
+```
+
+#### Why this is sufficient
+
+With `compareAndSet`, exactly one thread passes the gate. The second thread returns immediately from `disconnect()`. This breaks the deadlock because:
+
+1. **Thread A** wins the `compareAndSet` → enters `synchronized(lock)` → calls `resource.close()` → `HttpSession.getAttribute()` → **blocked** (Thread B holds HttpSession lock)
+2. **Thread B** loses the `compareAndSet` → **returns immediately** from `disconnect()` → continues the `invalidate()` callback chain → `invalidate()` completes → **releases HttpSession lock**
+3. **Thread A** unblocks → `getAttribute()` succeeds → disconnect completes normally
+
+The key insight: Thread B returning from `disconnect()` allows the `HttpSession.invalidate()` call to finish and release the HttpSession lock. Thread A was only blocked because Thread B held that lock — once released, Thread A proceeds without contention.
+
+#### Additional changes required
+
+- `push()` reads `disconnecting` — its `if (disconnecting || !isConnected())` check needs to change to `if (disconnecting.get() || !isConnected())`. Same `volatile`-read semantics.
+- `readObject()` (deserialization) should reinitialize: `disconnecting = new AtomicBoolean(false);`
+
+### Fix 1b (Additional improvement): Move `resource.close()` outside `synchronized`
+
+This is not required for correctness (Fix 1a alone prevents the deadlock), but is recommended as defense in depth:
+
+- **Eliminates the lock-ordering dependency structurally** — even if a future code path bypasses the `compareAndSet` gate (subclass, reflection, refactor), the lock ordering cannot deadlock.
+- **Reduces lock holding time** — `resource.close()` may involve network I/O (closing a WebSocket); holding the internal lock during that time blocks all concurrent `push()` calls unnecessarily.
+- **Protects against other container locks** — there may be other internal locks that Atmosphere's close path interacts with, not just the HttpSession lock.
+
+**Method change** (building on Fix 1a):
+
+```java
+@Override
+public void disconnect() {
     if (!disconnecting.compareAndSet(false, true)) {
         getLogger().debug("Disconnection already in progress, ignoring request");
         return;
@@ -153,29 +223,17 @@ public void disconnect() {
             }
             // Capture the resource reference and update internal state
             // while holding the lock, but defer the actual close to
-            // outside the synchronized block. This avoids a deadlock
-            // with containers (e.g., WebSphere) that synchronize on the
-            // HttpSession during both getAttribute() and invalidate(),
-            // since Atmosphere's close path calls
-            // SessionTimeoutSupport.restoreTimeout() which accesses
-            // the HttpSession.
+            // outside the synchronized block.
             resourceToClose = resource;
             connectionLost(); // Sets resource = null, state = DISCONNECTED
         }
     } finally {
-        // Reset only after resource.close() completes (or if we
-        // returned early). This ensures the flag stays true during
-        // the entire close operation, including the part outside the
-        // synchronized block.
         if (resourceToClose == null) {
             disconnecting.set(false);
         }
     }
 
     // Close the Atmosphere resource outside the synchronized block.
-    // At this point, internal state is already DISCONNECTED and
-    // resource is null, so concurrent calls to disconnect() or
-    // push() will see the connection as already closed.
     if (resourceToClose != null) {
         try {
             resourceToClose.close();
@@ -188,27 +246,12 @@ public void disconnect() {
 }
 ```
 
-### Why this fixes both issues
+#### Safety
 
-| Problem | How it's fixed |
-|---|---|
-| **Deadlock (lock ordering)** | `resource.close()` is called outside `synchronized(lock)`, so `AtmospherePushConnection.lock` is never held when `HttpSession.getAttribute()` is called. The lock-ordering cycle is broken. |
-| **TOCTOU race** | `disconnecting.compareAndSet(false, true)` is atomic — exactly one thread passes the gate, regardless of timing relative to the `synchronized` block. The second thread always sees `true` and returns. |
-| **Flag stays true during close** | `disconnecting` is reset to `false` only after `resource.close()` completes (or on early return). With the old code, the flag was reset in the `finally` block inside the `synchronized` block, meaning it became `false` again before `resource.close()` was called — a semantic bug if the close were ever moved outside. |
-
-### Additional safety properties
-
-- `connectionLost()` sets `resource = null` and `state = DISCONNECTED` inside the synchronized block, so concurrent `push()` and `disconnect()` calls will see the connection as already closed.
-- The captured `resourceToClose` local variable is only visible to this thread.
-- Even if `resource.close()` fails or blocks, the `AtmospherePushConnection` is already in a clean DISCONNECTED state.
-- The `push()` method checks `disconnecting || !isConnected()` before entering its synchronized block, so no messages will be sent to the closing resource. (Note: `push()` reads the `AtomicBoolean` via `disconnecting.get()`, which has the same `volatile` read semantics as before.)
-
-### Considerations
-
-- `resource.close()` is now called without the lock. Atmosphere's `AtmosphereResourceImpl.close()` has its own internal guards and is designed to be called from arbitrary threads (e.g., timeout handlers), so this should be safe.
-- The `outgoingMessage.get()` wait still happens inside the lock. It has a 1-second timeout and does not interact with the HttpSession, so it is not part of the deadlock cycle.
-- The `push()` method references `disconnecting` — its check `if (disconnecting || !isConnected())` needs to change from a field read to `disconnecting.get()`. This is a trivial change with identical volatile-read semantics.
-- `readObject()` (deserialization) should reinitialize the `AtomicBoolean`: `disconnecting = new AtomicBoolean(false);`
+- `connectionLost()` sets `resource = null` and `state = DISCONNECTED` inside the lock, so concurrent `push()` and `disconnect()` calls see the connection as closed.
+- The captured `resourceToClose` local is only visible to this thread.
+- `resource.close()` is called without the lock. Atmosphere's `AtmosphereResourceImpl.close()` has its own internal guards and is designed to be called from arbitrary threads (e.g., timeout handlers).
+- The `outgoingMessage.get()` wait stays inside the lock. It has a 1-second timeout and does not interact with the HttpSession, so it is not part of the deadlock cycle.
 
 ---
 
@@ -337,18 +380,21 @@ This only addresses Thread A's path. Thread B (Flow `UIInternals.setSession(null
 
 ## Recommendation
 
-| Fix | Scope | Breaks cycle from | Fixes TOCTOU? | Sufficient alone? | Risk |
-|---|---|---|---|---|---|
-| Fix 1 | Flow | Thread A side | Yes (`AtomicBoolean`) | Yes | Low — local refactor, no API change |
-| Fix 2 | Flow | Thread B side | No (separate concern) | Yes | Low — mirrors proven Vaadin 7 pattern |
-| Fix 3 | MPR | Thread A side | No (separate concern) | Yes* | Low — isolated to MPR adapter |
+| Fix | Scope | What it does | Sufficient alone? | Risk |
+|---|---|---|---|---|
+| **Fix 1a** | Flow | `AtomicBoolean.compareAndSet` gate | **Yes** | **Minimal** — one field + one method change |
+| Fix 1b | Flow | Also moves `resource.close()` outside lock | Yes | Low — local refactor, defense in depth |
+| Fix 2 | Flow | Async push disconnect in `UIInternals` | Yes | Low — mirrors proven Vaadin 7 pattern |
+| Fix 3 | MPR | Async disconnect in `MprPushConnection` | Yes* | Low — isolated to MPR adapter |
 
 \* Fix 3 is sufficient because Thread A is the only path that creates the `AtmospherePushConnection.lock` -> `HttpSession lock` dependency. If Thread A no longer holds `AtmospherePushConnection.lock` when calling into the HttpSession, the cycle is broken.
 
-**Recommended approach:** Apply **Fix 1** as the primary fix in Flow. It addresses both problems:
-1. The structural root cause — holding `synchronized(lock)` while calling `resource.close()` which reaches into the HttpSession.
-2. The TOCTOU race on the `disconnecting` flag — replacing `volatile boolean` with `AtomicBoolean.compareAndSet()` ensures exactly one thread enters the disconnect path.
+**Recommended approach:**
 
-Apply **Fix 3** as a stopgap if a Flow release is not immediately available.
+1. **Fix 1a** as the primary fix — the smallest change that fully prevents the deadlock. Replacing `volatile boolean` with `AtomicBoolean.compareAndSet()` ensures exactly one thread enters the disconnect path; the second thread returns immediately, letting `HttpSession.invalidate()` complete and release the HttpSession lock.
 
-Fix 2 is recommended as defense-in-depth: it makes Flow consistent with Vaadin 7's established pattern and protects against similar deadlocks with other locks that Atmosphere or the container may hold.
+2. **Fix 1b** as an additional improvement — moving `resource.close()` outside `synchronized(lock)` eliminates the lock-ordering dependency structurally, reduces lock holding time, and protects against future code paths that might bypass the `compareAndSet` gate.
+
+3. **Fix 3** as a stopgap if a Flow release is not immediately available.
+
+Fix 2 is recommended as further defense-in-depth: it makes Flow consistent with Vaadin 7's established pattern and protects against similar deadlocks with other locks that Atmosphere or the container may hold.
