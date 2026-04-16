@@ -133,3 +133,72 @@ Vaadin 7 already recognized the risk of deadlocks during push disconnection. The
 > *"This intentionally does disconnect without locking the VaadinSession to avoid deadlocks where the server uses a lock for the websocket connection"*
 
 However, this avoidance only prevents a `VaadinSession lock` -> `websocket lock` deadlock. In the MPR scenario on WebSphere, the deadlock involves `AtmospherePushConnection.lock` and `HttpSession lock` — neither of which is the VaadinSession lock. The async thread pattern avoids one deadlock but does not prevent this different one.
+
+## Existing Mitigation: the `disconnecting` Flag (TOCTOU Race)
+
+`AtmospherePushConnection.disconnect()` already contains a mitigation for this exact deadlock — a `volatile boolean disconnecting` flag checked at the top of the method:
+
+```java
+public void disconnect() {
+    // "This also prevents potential deadlocks if the container acquires
+    //  locks during operations on HTTP session, as closing the
+    //  AtmosphereResource may cause HTTP session access"
+    if (disconnecting) {               // ← CHECK  (outside synchronized)
+        return;
+    }
+
+    synchronized (lock) {              // ← ACQUIRE LOCK
+        // ...
+        try {
+            disconnecting = true;      // ← SET FLAG (inside synchronized)
+            // ...
+            resource.close();          // ← calls HttpSession.getAttribute()
+        } finally {
+            disconnecting = false;
+        }
+    }
+}
+```
+
+The comment shows the Vaadin developers were aware of the deadlock risk and intended this flag to prevent it. **The flag does dramatically narrow the race window, but it cannot eliminate it** because of a classic check-then-act (TOCTOU) race condition:
+
+1. The flag is **read** outside `synchronized(lock)`.
+2. The flag is **written** inside `synchronized(lock)`, after the lock is acquired.
+
+This means there is a window — between a thread acquiring `synchronized(lock)` and setting `disconnecting = true` — during which another thread can read the flag as `false` and proceed to block on `synchronized(lock)`.
+
+### Concrete TOCTOU timeline for the deadlock
+
+| Time | Thread A (push disconnect) | Thread B (session invalidate) | `disconnecting` |
+|------|---------------------------|-------------------------------|-----------------|
+| t₁ | Reads `disconnecting` → `false` | *(inside `httpSession.invalidate()`, holds HttpSession lock, processing callbacks)* | `false` |
+| t₂ | Enters `synchronized(lock)` ✓ | | `false` |
+| t₃ | | Reads `disconnecting` → **`false`** *(Thread A hasn't set it yet)* | `false` |
+| t₄ | Sets `disconnecting = true` | | **`true`** |
+| t₅ | Calls `resource.close()` → `getAttribute()` → **BLOCKED** *(HttpSession lock held by B)* | Enters `synchronized(lock)` → **BLOCKED** *(held by A)* | `true` |
+| | **DEADLOCK** | **DEADLOCK** | |
+
+At **t₃**, Thread B reads `disconnecting` after Thread A has acquired the lock (t₂) but before Thread A has set the flag (t₄). The `volatile` keyword guarantees visibility of writes, but Thread B's read at t₃ precedes Thread A's write at t₄ in real time, so Thread B sees `false`.
+
+### How narrow is the window?
+
+Between t₂ (lock acquired) and t₄ (flag set), the code executes only:
+
+```java
+synchronized (lock) {                              // t₂
+    if (!isConnected() || resource == null) { ... } // ~two field reads
+    try {
+        disconnecting = true;                      // t₄
+```
+
+This is on the order of **nanoseconds**. The flag therefore reduces the deadlock probability by orders of magnitude compared to having no guard at all. But "extremely unlikely per attempt" still means "inevitable over enough attempts in production" — particularly on busy WebSphere servers with many concurrent SAML logouts.
+
+### Why it still happens in the customer's environment
+
+- **Volume:** Thousands of SAML logouts per day × nanosecond window = eventual occurrence.
+- **IBM J9 JVM:** WebSphere's JVM and thread scheduler may have different timing characteristics than HotSpot, subtly widening the window.
+- **Multi-socket NUMA servers:** A `volatile` write on one CPU socket may take additional nanoseconds to become visible on another socket's L1 cache, enlarging the window.
+
+### Correct fix
+
+The TOCTOU cannot be fixed by adjusting the position of the `volatile` flag alone. The fundamental problem is that `resource.close()` is called **inside** `synchronized(lock)`, creating a lock-ordering dependency with the container's HttpSession lock. See `RECOMMENDED_FIX.md` for the structural fixes that eliminate the deadlock entirely.
