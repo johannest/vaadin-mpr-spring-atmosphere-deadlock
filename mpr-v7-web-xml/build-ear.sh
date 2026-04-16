@@ -17,7 +17,7 @@ CONTEXT_ROOT="/mprdemo"
 
 # Pass any extra Maven arguments (e.g., -Pproduction)
 echo "=== Building WAR ==="
-mvn clean package -DskipTests "$@"
+mvn clean package -DskipTests -Pproduction "$@"
 
 WAR_PATH="target/${WAR_NAME}"
 if [ ! -f "$WAR_PATH" ]; then

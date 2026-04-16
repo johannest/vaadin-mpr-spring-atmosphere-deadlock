@@ -11,6 +11,11 @@
         <session-timeout>30</session-timeout>
     </session-config>
 
+    <context-param>
+        <param-name>productionMode</param-name>
+        <param-value>true</param-value>
+    </context-param>
+
     <!--
         WebSphere fallback: explicitly bootstrap the Spring ApplicationContext.
 
@@ -22,10 +27,10 @@
         MUST be declared BEFORE the DelegatingFilterProxy so the Spring
         context exists when the filter's first doFilter() tries to look
         up the "springSecurityFilterChain" bean.
-    -->
+
     <listener>
         <listener-class>org.vaadin.mprdemo.WebSphereBootstrapListener</listener-class>
-    </listener>
+    </listener> -->
 
     <!--
         Spring Security filter.  Lazily resolves the "springSecurityFilterChain"

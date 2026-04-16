@@ -22,7 +22,7 @@
 		<vaadin7.version>7.7.41</vaadin7.version>
 		<vaadin.plugin.version>7.7.41</vaadin.plugin.version>
 		<mpr.version>2.3.0</mpr.version>
-		<java.version>11</java.version>
+		<java.version>1.8</java.version>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 	</properties>
 
