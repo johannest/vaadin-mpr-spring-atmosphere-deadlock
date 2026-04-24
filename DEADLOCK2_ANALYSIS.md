@@ -23,10 +23,12 @@ is only on `disconnect()`, so it cannot prevent this. Both `disconnect()` and `p
 share the **same** `synchronized(lock)` monitor, and that monitor is still held across
 a call (`resource.close()`) that re-enters the container's HttpSession lock.
 
-**Conclusion:** Fix 1a alone was insufficient. Fix 1b (move `resource.close()` outside
-`synchronized(lock)`) is now required — it is the only change that breaks the
-lock-ordering cycle structurally, regardless of which Flow API re-enters the
-push connection while HttpSession lock is held.
+**Conclusion:** Fix 1a alone was insufficient. Two changes are now required together:
+
+1. **Move `resource.close()` outside `synchronized(lock)`** in `disconnect()` — breaks the forward leg of the lock-ordering cycle.
+2. **Add an `isConnected()` double-check inside `synchronized(lock)` in `push()`** — prevents an NPE that would otherwise occur once `disconnect()` can null `resource` while `push()` is waiting on the same monitor.
+
+Moving `resource.close()` outside the lock without the `push()` double-check would eliminate the deadlock but replace it with a race-induced `NullPointerException` inside `sendMessage()`. Moving the double-check into `push()` without relocating `resource.close()` would not help either — `push()` would still block on `synchronized(lock)` while holding the HttpSession lock. **Both changes must be made together.**
 
 ---
 
@@ -78,7 +80,7 @@ synchronized (lock) {
 
 The recommended version had `disconnecting.set(false);` before that `return`. If this branch is ever taken, the flag is stuck at `true` — all subsequent `disconnect()` calls CAS-fail, and `push()` permanently treats the connection as "disconnecting".
 
-This is not the cause of the current deadlock (Thread A is clearly past this check — it is at `resource.close()`), but it should be fixed alongside the main change.
+This is not the cause of the current deadlock (Thread A is clearly past this check — it is at `resource.close()`), but it should be fixed alongside the main change. The proposed fix (below) subsumes it by moving `disconnecting.set(false)` to an outer `finally` that covers every exit path uniformly.
 
 ---
 
@@ -149,6 +151,10 @@ Several things are different compared to the original Thread B:
 
 - **Holds:** WebSphere HttpSession lock (from `invalidate()` — never released until the entire callback chain returns) + Flow `VaadinSession` ReentrantLock.
 - **Wants:** `AtmospherePushConnection.lock`.
+
+### Cascading impact on the WebSphere thread pool
+
+The two thread dumps the customer sent (`ThreadA_2.txt`, `ThreadB_2.txt`) show only the two threads in the cycle, but an independent analysis of the same customer's full IBM javacore dumps reported **7+ additional worker threads** in `BLOCKED` state waiting on the same `MemorySession` monitor held by Thread B. Once the deadlock forms, every subsequent request that touches the invalidating HttpSession pins another worker; with a bounded WebSphere thread pool this saturates quickly and produces the application-level hang the customer observes. This is consistent with the reported symptom (application stops responding) and is a useful post-fix signal: under the fix, no such pile-up should form.
 
 ---
 
@@ -269,7 +275,7 @@ Note that `MprPushConnection.push()` has an `isClosing()` guard that could in pr
 
 ---
 
-## What Makes This Fix-Resistant Without Fix 1b
+## Why Breaking Leg 1 Is the Only Maintainable Fix
 
 The lock-ordering cycle has two legs. To break it, you need to break *either* leg:
 
@@ -278,31 +284,34 @@ The lock-ordering cycle has two legs. To break it, you need to break *either* le
 Held in `disconnect()` at `resource.close()`. **Still present in 14.14.2.**
 
 Breakable by:
-- **Fix 1b** — move `resource.close()` outside `synchronized(lock)`. (Structural, clean.)
-- Making `resource.close()` itself not touch `HttpSession`. (Requires changing Atmosphere / upstream.)
-- Pre-detaching the HttpSession from `AtmosphereResource` before `close()`. (Possible but fiddly.)
+- **Moving `resource.close()` outside `synchronized(lock)`** (the primary change proposed below). Structural, clean, local to one file.
+- Making `resource.close()` itself not touch `HttpSession` (requires changing Atmosphere or excluding its `SessionTimeoutSupport` interceptor — the no-code-change workaround).
+- Pre-detaching the HttpSession from `AtmosphereResource` before `close()` (possible but fiddly).
 
 ### Leg 2 — reverse: `HttpSession` lock → `AtmospherePushConnection.lock`
 
 Held whenever a session-destruction callback acquires `AtmospherePushConnection.lock`. This can happen via **many** callers in the MPR+Flow stack:
 
-- `UIInternals.setPushConnection(null)` → `disconnect()`. ← fixed by 1a (on Flow side).
-- Flow's `VaadinSession.unlock()` push loop → `UI.push()` → `AtmospherePushConnection.push()`. ← **NEW deadlock**, not fixed.
+- `UIInternals.setPushConnection(null)` → `disconnect()`. ← closed by 14.14.2's Fix 1a (on the Flow side).
+- Flow's `VaadinSession.unlock()` push loop → `UI.push()` → `AtmospherePushConnection.push()`. ← **the NEW deadlock**, not fixed by 14.14.2.
 - Any code path that pushes or disconnects a connected `AtmospherePushConnection` from inside a session-invalidation callback. There could be others.
 
 Breakable only by either:
 - Never calling into `AtmospherePushConnection` from inside an `invalidate()` callback (very invasive — you would have to change how MPR bridges V7 session destruction into Flow, and how Flow's `unlock()` behaves when called transitively from `invalidate()`).
-- Or, breaking **Leg 1** — so the forward direction doesn't exist and the cycle is impossible regardless of how many callers take the reverse leg.
+- Or, breaking **Leg 1** — so the forward direction does not exist and the cycle is impossible regardless of how many callers take the reverse leg.
 
-Leg 1 is a single, well-defined, local change. Leg 2 has many callers and they are not all controllable (`unlock()`'s push loop is core Flow behaviour invoked from everywhere). **The only maintainable fix is to break Leg 1, which is what Fix 1b does.**
+Leg 1 is a single, well-defined, local change. Leg 2 has many callers and they are not all controllable (`unlock()`'s push loop is core Flow behaviour invoked from everywhere). **The only maintainable fix is to break Leg 1.** The `push()` double-check described below is a companion change that keeps `push()` safe after the primary change removes the implicit "resource is alive while monitor is held" invariant.
 
 ---
 
 ## Recommended Fix (Now Mandatory)
 
-Apply **Fix 1b from RECOMMENDED_FIX.md** on top of the 14.14.2 Fix 1a.
+Two coordinated changes to `AtmospherePushConnection`:
 
-The key change is to capture `resource` into a local, mark the connection as disconnected inside the lock, then `close()` the resource **outside** `synchronized(lock)`:
+1. **`disconnect()`**: capture `resource` into a local, mark the connection disconnected inside the lock, then `close()` the resource **outside** `synchronized(lock)`. Wrap the whole method in an outer `try / finally` so `disconnecting.set(false)` fires on every exit path (including the `close()` exception path).
+2. **`push()`**: re-check `isConnected()` **inside** `synchronized(lock)`. If the connection was torn down while `push()` was contending for the monitor, transition to the appropriate pending state and return without touching `resource` (which will now be `null`).
+
+### `disconnect()` — move `resource.close()` outside the lock
 
 ```java
 @Override
@@ -311,9 +320,8 @@ public void disconnect() {
         getLogger().debug("Disconnection already in progress, ignoring request");
         return;
     }
-
-    AtmosphereResource resourceToClose = null;
     try {
+        AtmosphereResource resourceToClose = null;
         synchronized (lock) {
             if (!isConnected() || resource == null) {
                 getLogger().debug("Disconnection already happened, ignoring request");
@@ -333,95 +341,152 @@ public void disconnect() {
                 }
                 outgoingMessage = null;
             }
-            // Capture the resource ref and clear internal state under the lock,
-            // but DEFER the actual close() to outside the lock.
+            // Capture the resource and update internal state under the lock,
+            // but DEFER the actual close() to outside the lock. close() may
+            // call back into HttpSession via Atmosphere's SessionTimeoutSupport
+            // interceptor; holding this monitor while that happens creates the
+            // lock-ordering cycle with the container's HttpSession lock.
             resourceToClose = resource;
-            connectionLost();       // sets resource=null, state=DISCONNECTED
+            connectionLost();   // sets resource = null, state = DISCONNECTED
+        }
+        if (resourceToClose != null) {
+            try {
+                resourceToClose.close();
+            } catch (IOException e) {
+                getLogger().info("Error when closing push connection", e);
+            }
         }
     } finally {
-        if (resourceToClose == null) {
-            disconnecting.set(false);
-        }
-    }
-
-    if (resourceToClose != null) {
-        try {
-            resourceToClose.close();   // NOW outside synchronized(lock) — no lock-order cycle
-        } catch (IOException e) {
-            getLogger().info("Error when closing push connection", e);
-        } finally {
-            disconnecting.set(false);
-        }
+        disconnecting.set(false);
     }
 }
 ```
 
-### Why this resolves the new deadlock
+Key points:
 
-- Thread A enters `disconnect()`, CAS succeeds, enters `synchronized(lock)`, captures `resourceToClose`, calls `connectionLost()` (sets `resource = null`, `state = DISCONNECTED`), **releases the lock**.
-- Thread A now calls `resourceToClose.close()` → `HttpSession.getAttribute()` → blocked on HttpSession lock (still held by Thread B).
-- Thread B's `push()` can now **acquire** `AtmospherePushConnection.lock` (no one holds it). It re-reads state: `isConnected()` is false because `connectionLost()` has set the state to DISCONNECTED. `push()` sees the connection is no longer connected and takes the "disconnected" branch (sets state to PUSH_PENDING/RESPONSE_PENDING). It releases the lock and returns.
-- Thread B continues up its stack: `UI.push()` returns, `VaadinSession.unlock()` finishes its push loop, `ensureAccessQueuePurged` returns, Vaadin 7's `session.access()` returns, `fireSessionDestroy(454)` returns, `valueUnbound` returns. WebSphere's `invalidate()` continues processing, eventually **releases the HttpSession lock**.
-- Thread A's `getAttribute()` call unblocks, `resource.close()` completes, `disconnect()` returns.
+- **`resource.close()` is outside `synchronized(lock)`.** Thread A never holds the monitor while waiting on the HttpSession lock. Leg 1 of the cycle is gone.
+- **`connectionLost()` runs inside the lock before release.** Any concurrent `push()` that acquires the monitor afterwards sees `state == DISCONNECTED` and `resource == null` (via the double-check added below).
+- **Outer `try / finally` for `disconnecting.set(false)`.** Covers every exit path — the early `return`s inside the monitor, the normal completion path after `close()`, and the path where `close()` itself throws an unchecked exception. The latent bug from the 14.14.2 fix (early `return` leaving `disconnecting = true` forever) is subsumed by this structure: regardless of how the method exits, the flag is reset.
+- **`resourceToClose` as ownership handover.** The local is populated under the lock, `this.resource` is nulled in the same critical section, so no other thread can reach the same `AtmosphereResource` via the field afterwards. The owning thread calls `close()` unlocked.
 
-No circular wait is possible because **Thread A never holds `AtmospherePushConnection.lock` while waiting on the HttpSession lock**. Leg 1 is broken.
-
-### Additional fix — reset `disconnecting` on the "already disconnected" early return
-
-While making Fix 1b, also fix the latent bug:
+### `push(boolean async)` — re-check `isConnected()` under the lock
 
 ```java
-if (!isConnected() || resource == null) {
-    getLogger().debug("Disconnection already happened, ignoring request");
-    disconnecting.set(false);    // <-- add this
-    return;
+public void push(boolean async) {
+    boolean isDisconnecting = disconnecting.get();
+    if (isDisconnecting || !isConnected()) {
+        if (isDisconnecting) {
+            getLogger().debug("Disconnection in progress, ignoring push request");
+        }
+        if (async && state != State.RESPONSE_PENDING) {
+            state = State.PUSH_PENDING;
+        } else {
+            state = State.RESPONSE_PENDING;
+        }
+    } else {
+        synchronized (lock) {
+            // Re-check under the lock: disconnect() may have acquired it first,
+            // called connectionLost() (resource = null, state = DISCONNECTED),
+            // and released it before we got here. Without this guard,
+            // sendMessage() would NPE on getResource() when resource is null.
+            if (!isConnected()) {
+                if (async && state != State.RESPONSE_PENDING) {
+                    state = State.PUSH_PENDING;
+                } else {
+                    state = State.RESPONSE_PENDING;
+                }
+                return;
+            }
+            try {
+                JsonObject response = new UidlWriter().createUidl(getUI(), async);
+                sendMessage("for(;;);[" + response.toJson() + "]");
+            } catch (Exception e) {
+                throw new RuntimeException("Push failed", e);
+            }
+        }
+    }
 }
 ```
 
-Without this, a race between two `disconnect()` callers where the first one completes while the second is waiting on the monitor would leave `disconnecting == true` forever.
+Why this second change is **required**, not optional: without it, the following perfectly-legal post-fix ordering NPEs:
 
-### Concurrency safety of Fix 1b
+1. Push reads `disconnecting == false && isConnected() == true` **outside** the monitor, commits to the `else` branch.
+2. Disconnect runs to completion: CAS, `synchronized(lock)`, `connectionLost()` (nulls `resource`, sets `DISCONNECTED`), releases the lock, then starts `resource.close()` unlocked.
+3. Push acquires the now-free monitor and calls `sendMessage()` → `getResource().getBroadcaster()` → **NPE on null resource**.
 
-- `connectionLost()` runs inside the lock and sets `resource = null` + `state = DISCONNECTED`. Any concurrent `push()` that subsequently acquires the lock sees the disconnected state and takes the short path. Any subsequent `disconnect()` enters and returns at the `!isConnected() || resource == null` check.
+The deadlock would be gone, but replaced by a stale-read NPE. The double-check closes the window: once inside the monitor, `push()` observes the state that `connectionLost()` published under the same monitor (Java memory model guarantees visibility), takes the pending-state branch, and returns without touching `resource`. The deferred-push bookkeeping (`PUSH_PENDING` / `RESPONSE_PENDING`) preserves the semantics of the outer check so no UIDL is silently lost.
+
+### Why the push double-check cannot stand alone either
+
+Just adding the `push()` double-check without moving `resource.close()` out of the lock does not help. In that world, `push()` would reach `synchronized(lock)` while holding the HttpSession lock (it is still in the `VaadinSession.unlock()` → `UI.push()` chain on the same thread that is inside `HttpSession.invalidate()`), and `disconnect()` still holds the monitor waiting on the HttpSession lock. The double-check would never execute because push is still blocked on monitor entry. The deadlock is unchanged — just moved one instruction later. **Both changes are needed.**
+
+### Concurrency safety
+
+- `connectionLost()` runs inside the lock and sets `resource = null` + `state = DISCONNECTED`. Any concurrent `push()` that subsequently acquires the lock sees the disconnected state via the added double-check and takes the pending-state path. Any subsequent `disconnect()` enters and returns at the `!isConnected() || resource == null` check; the outer `finally` still resets `disconnecting`.
 - `outgoingMessage.get(1000ms)` stays inside the lock. It has its own timeout, does not touch HttpSession, and is not part of any known lock cycle.
-- `resourceToClose.close()` is called without locks, from a single thread (the one that won the CAS). Atmosphere's `AtmosphereResourceImpl.close()` is itself thread-safe against its own concurrent callers (it has internal `isClosed`/cancel guards), and is routinely called from timeout threads, so calling it unlocked is supported.
-- `push()` will not race with `close()` on the captured `resource` local, because we set `this.resource = null` before exiting the lock. The `resourceToClose` reference is only visible to Thread A.
+- `resourceToClose.close()` runs without locks, from a single thread (the one that won the CAS). Atmosphere's `AtmosphereResourceImpl.close()` has its own internal guards and is routinely called from timeout threads, so calling it unlocked is supported.
+- `push()` cannot race with `close()` on the captured `resource` local: by the time `close()` runs, `this.resource = null` has been published under the same monitor that `push()` must acquire before reading it. The captured `resourceToClose` is visible only to the disconnecting thread.
+
+### Three-case correctness
+
+| Ordering | Outcome |
+|---|---|
+| **Disconnect wins the monitor, push runs after** (post-fix typical) | Disconnect: CAS, lock, `connectionLost()`, release, `close()` (may block on HttpSession). Push: sees `disconnecting == true` via outer read **or** sees `isConnected() == false` via inner double-check; sets pending state, returns. No NPE, no deadlock. |
+| **Push wins the monitor, disconnect runs after** | Push: double-check passes, `sendMessage()` runs, release. Disconnect: CAS, lock, `connectionLost()`, release, `close()`. Clean. |
+| **Push reads `disconnecting == false` pre-CAS (the race)** | Push enters `else` branch but is not yet in the monitor. Disconnect slips in, completes the in-lock phase, releases the monitor. Push acquires the monitor, double-check observes `state == DISCONNECTED`, takes the pending-state branch, returns. No circular wait because disconnect has already released the monitor before starting its (blocking) `close()`. |
+
+In every ordering, no thread ever holds `AtmospherePushConnection.lock` while waiting on the HttpSession lock. The lock-ordering cycle is structurally impossible.
 
 ---
 
 ## Complementary / Alternative Fixes
 
-Fix 1b is sufficient on its own. Evaluating the other options from `RECOMMENDED_FIX.md` against this new deadlock:
+Evaluating the other options against this new deadlock:
 
 | Fix | Helps with the new deadlock? | Notes |
 |---|---|---|
-| **Fix 1a** (already applied) | Partially — only disconnect-vs-disconnect. | Keep it; it closes the original path cleanly. |
-| **Fix 1b** (move `close()` outside lock) | **Yes — eliminates Leg 1 of the cycle.** | Required. |
-| **Fix 2** (async push disconnect in `UIInternals.setSession`) | **No.** Thread B in the new dump is in `unlock()`'s push loop, not `UIInternals.setSession`. | Still a good defence-in-depth for the original Flow path, but does not address the new case. |
-| **Fix 3** (async disconnect in `MprPushConnection`) | **No.** Thread A is already on a dedicated async thread (`UI$3.run`). Wrapping it in yet another thread only shifts the locking onto the new thread; `resource.close()` is still inside `synchronized(lock)` on whichever thread executes it. | Do not pursue. |
+| **Fix 1a** (already applied, AtomicBoolean CAS on `disconnect()`) | Partially — closes the original disconnect-vs-disconnect race. | Keep it; harmless, closes one known path. |
+| **Fix 1b + `push()` double-check** (move `close()` outside lock, re-check under lock in `push()`) | **Yes — eliminates the cycle and the post-fix NPE.** | Required together. |
+| **Fix 2** (async push disconnect in `UIInternals.setSession`) | **No.** Thread B in the new dump is in `unlock()`'s push loop, not `UIInternals.setSession`. | Still a useful defence-in-depth for the original Flow path, but does not address the new case. |
+| **Fix 3** (async disconnect in `MprPushConnection`) | **No.** Thread A is already on a dedicated async thread (`UI$3.run`). Wrapping it in yet another thread only shifts the same locking onto that thread. | Do not pursue. |
+| **Disable Atmosphere's `SessionTimeoutSupport` interceptor** | **Yes, as a stopgap.** | No-code-change workaround — see below. |
 
-**Recommended disposition:**
+### No-code-change stopgap: disable `SessionTimeoutSupport`
 
-1. Apply **Fix 1b** in flow-server and release as 14.14.3 (or the equivalent Flow 2.13.x patch).
-2. Also apply the `disconnecting.set(false)` reset on the early-disconnect return (latent bug).
-3. Keep Fix 1a (already shipped).
-4. Consider Fix 2 as a separate, longer-term defence-in-depth for consistency with the Vaadin 7 async detach pattern — but it is not required for this customer's deadlock.
+The specific Atmosphere component that reaches into `HttpSession` from inside `resource.close()` is `org.atmosphere.cpr.SessionTimeoutSupport`. It is the interceptor that saves and restores the HTTP session timeout around async operations; its `restoreTimeout()` calls `HttpSessionFacade.getAttribute()` which acquires WebSphere's `MemorySession` monitor. Excluding / disabling this interceptor removes the HttpSession access from the close path and therefore eliminates the forward leg of the cycle without touching Vaadin code.
+
+This is useful if a flow-server patch cannot be deployed quickly, but the long-term fix is still the `AtmospherePushConnection` changes above — they are localised and do not depend on Atmosphere's optional components.
+
+### Recommended disposition
+
+1. Apply the combined **Fix 1b + `push()` double-check** in flow-server and release as 14.14.3 (or the equivalent Flow 2.13.x patch). The outer `try / finally` in `disconnect()` subsumes the "reset `disconnecting` on early return" latent bug fix uniformly.
+2. Keep Fix 1a (already shipped).
+3. As a customer stopgap until 14.14.3 is available, disable Atmosphere's `SessionTimeoutSupport` interceptor.
+4. Consider Fix 2 as a separate, longer-term defence-in-depth for consistency with the Vaadin 7 async detach pattern — not required for this customer's deadlock.
 
 ---
 
 ## Validation Suggestions
 
-Before shipping, verify Fix 1b with targeted tests / reasoning:
+Before shipping, verify the combined fix with targeted tests / reasoning:
 
-1. **Unit test: concurrent disconnect + push.** Simulate one thread inside `disconnect()` between lock release and `resource.close()`, and another thread calling `push()`. Confirm `push()` sees disconnected state and returns without blocking.
+1. **Unit test: concurrent disconnect + push.** Simulate one thread inside `disconnect()` between lock release and `resource.close()`, and another thread calling `push()`. Confirm `push()` observes the disconnected state under the double-check and returns without blocking or throwing NPE.
 2. **Replication on WebSphere.** Re-run `reproduce-deadlock.sh` / `DeadlockTriggerServlet` on WebSphere 9.0.5.25 with the customer's exact stack. The forced mode in `DeadlockTriggerServlet` currently only races `disconnect()` vs `invalidate()`; extend it to also race `push()` (explicit `ui.push()` call while `disconnect()` is in progress) to prove the new case is reproducible pre-fix and gone post-fix.
-3. **MPR integration smoke test.** Exercise the full MPR logout flow (legacy UI detach + Flow UI detach + SAML2 logout) under load and confirm no deadlocks after the fix.
-4. **Check for other call sites holding `AtmospherePushConnection.lock` across a container callback.** Grep flow-server for `synchronized (lock)` in `AtmospherePushConnection` and follow any callee that could re-enter HttpSession (or any other shared container lock). After Fix 1b the only code paths inside the synchronised block are in-memory operations and `outgoingMessage.get(1000ms)` — none of those touch HttpSession — which makes Leg 1 structurally absent.
+3. **MPR integration smoke test.** Exercise the full MPR logout flow (legacy UI detach + Flow UI detach + SAML2 logout) under load and confirm:
+   - No `1LKDEADLOCK` blocks in post-operation thread dumps.
+   - No pile-up of worker threads `BLOCKED` on the `MemorySession` lock (the colleague's analysis noted 7+ cascading blocked threads per deadlock incident — their absence is a good post-fix signal).
+   - UI updates still arrive after a reconnect (the `PUSH_PENDING` / `RESPONSE_PENDING` deferred-push logic should replay any message that was in-flight during the disconnect).
+4. **Check for other call sites holding `AtmospherePushConnection.lock` across a container callback.** Grep flow-server for `synchronized (lock)` in `AtmospherePushConnection` and confirm that after the fix the only code paths inside the monitor are in-memory operations and `outgoingMessage.get(1000ms)` — none of which touch HttpSession — which makes Leg 1 structurally absent.
 
 ---
 
 ## Summary for the GitHub Issue Update
 
-> **Update (14.14.2):** The `AtomicBoolean` gate on `disconnect()` prevents the disconnect-vs-disconnect race but does not break the lock-ordering cycle between `AtmospherePushConnection.lock` and the WebSphere `HttpSession` lock. In the new customer thread dumps, Thread B is now blocked inside `AtmospherePushConnection.push()` (line 197) reached from `VaadinSession.unlock()`'s push loop, which is invoked transitively from Vaadin 7's `valueUnbound` via the MPR service bridge. The monitor is the same one `disconnect()` uses, so the same deadlock occurs — just through `push()` instead of `disconnect()`. The `AtomicBoolean` fix does not apply to `push()`, and cannot, because `push()` must legitimately acquire the monitor to send UIDL.
+> **Update (14.14.2):** The `AtomicBoolean` gate on `disconnect()` prevents the disconnect-vs-disconnect race but does not break the lock-ordering cycle between `AtmospherePushConnection.lock` and the WebSphere `HttpSession` (`MemorySession`) lock. In the new customer thread dumps, Thread B is now blocked inside `AtmospherePushConnection.push()` (line 197), reached from `VaadinSession.unlock()`'s push loop invoked transitively from Vaadin 7's `valueUnbound` via the MPR service bridge. The monitor is the same one `disconnect()` uses, so the same deadlock occurs — just through `push()` instead of `disconnect()`. JVM deadlock detection confirmed the cycle (`1LKDEADLOCK` block naming both threads); several additional worker threads piled up `BLOCKED` on `MemorySession`, which is what surfaces as a user-visible hang.
 >
-> The correct fix is **Fix 1b**: move `resource.close()` **outside** `synchronized(lock)` in `disconnect()`. This structurally removes the forward leg of the lock-ordering cycle and is robust against any future caller that reaches `AtmospherePushConnection` from within a session-invalidation callback.
+> **Required fix is two coordinated changes in `AtmospherePushConnection`:**
+>
+> 1. In `disconnect()`: move `resource.close()` outside `synchronized(lock)` — capture `resource` into a local, call `connectionLost()` inside the lock, release the lock, then call `close()` on the captured local. Wrap the whole method in an outer `try / finally` so `disconnecting.set(false)` fires on every exit path.
+> 2. In `push(boolean async)`: re-check `isConnected()` inside `synchronized(lock)`. If the connection was torn down while waiting for the monitor, set the pending state and return without calling `sendMessage()`.
+>
+> Change #1 removes the forward leg of the cycle. Change #2 prevents the race-induced NPE that change #1 would otherwise expose. Neither change alone is sufficient.
